@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -23,9 +22,9 @@ import (
 // SFTP服务器配置
 type SFTPConfig struct {
 	ListenAddr         string
-	HostKeyPath        string
-	AuthorizedKeysPath string
-	RootDir            string // 固定为程序目录下的FILES
+	HostKeyPath        string // 服务器私钥路径（当前目录）
+	AuthorizedKeysPath string // 授权公钥路径（当前目录）
+	RootDir            string // SFTP操作目录（FILES）
 }
 
 // 获取程序运行目录（兼容Windows）
@@ -37,12 +36,20 @@ func getAppDir() string {
 	return filepath.Dir(filepath.Clean(exePath))
 }
 
-// 生成服务器私钥
+// 生成服务器私钥（存当前目录，非FILES）
 func generateHostKey(path string) error {
+	// 确保私钥路径是当前目录（防止被切换到FILES）
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("获取私钥绝对路径失败: %v", err)
+	}
+
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return fmt.Errorf("生成私钥失败: %v", err)
 	}
+
+	// 创建私钥文件（当前目录）
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("创建私钥文件失败: %v", err)
@@ -53,14 +60,20 @@ func generateHostKey(path string) error {
 	if err := pem.Encode(file, pemBlock); err != nil {
 		return fmt.Errorf("编码私钥失败: %v", err)
 	}
-	log.Printf("服务器私钥已生成: %s", path)
+	log.Printf("服务器私钥已生成（当前目录）: %s", path)
 	return nil
 }
 
-// 加载授权公钥
+// 加载授权公钥（当前目录的authorized_keys）
 func loadAuthorizedKeys(path string) (map[string]bool, error) {
+	// 确保公钥文件路径是当前目录
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("获取公钥绝对路径失败: %v", err)
+	}
+
 	authorizedKeys := make(map[string]bool)
-	keyBytes, err := ioutil.ReadFile(path)
+	keyBytes, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取公钥失败: %v", err)
 	}
@@ -78,27 +91,14 @@ func loadAuthorizedKeys(path string) (map[string]bool, error) {
 	return authorizedKeys, nil
 }
 
-// 安全路径转换（核心：强制限制在FILES目录）
-func getSecurePath(rootDir, clientPath string) string {
-	// 处理Windows路径分隔符
-	clientPath = filepath.ToSlash(clientPath)
-	// 清理路径，防止遍历
-	cleanPath := filepath.Clean(filepath.Join(rootDir, clientPath))
-	// 强制限制在根目录内
-	if !filepath.HasPrefix(cleanPath, rootDir) {
-		cleanPath = rootDir
-	}
-	return cleanPath
-}
-
-// 处理SFTP连接（手动实现文件操作，不依赖Server方法）
+// 处理SFTP连接
 func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]bool) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	log.Printf("新连接: %s", conn.RemoteAddr())
 
-	// 加载服务器私钥
-	hostKeyBytes, err := ioutil.ReadFile(config.HostKeyPath)
+	// 加载服务器私钥（当前目录，不受工作目录切换影响）
+	hostKeyBytes, err := os.ReadFile(config.HostKeyPath)
 	if err != nil {
 		log.Printf("读取服务器私钥失败: %v", err)
 		return
@@ -159,13 +159,13 @@ func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]boo
 			for req := range reqs {
 				if req.Type == "subsystem" && len(req.Payload) > 4 && string(req.Payload[4:]) == "sftp" {
 					req.Reply(true, nil)
-					// 直接创建SFTP服务器，依赖默认文件系统+路径拦截
+					// 创建SFTP服务器（操作目录为FILES）
 					server, err := sftp.NewServer(chanConn)
 					if err != nil {
 						log.Printf("创建SFTP服务器失败: %v", err)
 						return
 					}
-					// 启动服务器（所有文件操作会被操作系统路径限制）
+					// 启动服务器（文件操作限制在FILES目录）
 					if err := server.Serve(); err != nil && err != io.EOF {
 						log.Printf("SFTP会话异常: %v", err)
 					}
@@ -178,60 +178,68 @@ func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]boo
 }
 
 func main() {
-	// 命令行参数
+	// 命令行参数（密钥文件默认当前目录）
 	listenAddr := flag.String("addr", ":2022", "监听地址")
-	hostKeyPath := flag.String("host-key", "./sftp_host_rsa", "服务器私钥路径")
-	authorizedKeysPath := flag.String("authorized-keys", "./authorized_keys", "授权公钥路径")
+	hostKeyPath := flag.String("host-key", "./sftp_host_rsa.pem", "服务器私钥路径（当前目录）")
+	authorizedKeysPath := flag.String("authorized-keys", "./authorized_keys", "授权公钥路径（当前目录）")
 	flag.Parse()
 
-	// 固定根目录为程序目录下的FILES
-	rootDir := filepath.Join(getAppDir(), "FILES")
-	// 强制切换工作目录到FILES（核心：让SFTP默认操作此目录）
-	if err := os.Chdir(rootDir); err != nil {
-		log.Fatalf("切换到FILES目录失败: %v", err)
-	}
-	// 确保FILES目录存在
-	if err := os.MkdirAll(rootDir, 0755); err != nil {
-		log.Fatalf("创建FILES目录失败: %v", err)
+	// 1. 初始化路径（核心区分：密钥存当前目录，操作目录是FILES）
+	appDir := getAppDir()                                  // 程序运行目录
+	operateDir := filepath.Join(appDir, "FILES")           // SFTP操作目录（FILES）
+	hostKeyAbsPath, _ := filepath.Abs(*hostKeyPath)        // 私钥绝对路径（当前目录）
+	authKeyAbsPath, _ := filepath.Abs(*authorizedKeysPath) // 公钥绝对路径（当前目录）
+
+	// 2. 确保FILES操作目录存在（仅用于文件操作）
+	if err := os.MkdirAll(operateDir, 0755); err != nil {
+		log.Fatalf("创建FILES操作目录失败: %v", err)
 	}
 
-	// 初始化配置
+	// 3. 切换工作目录到FILES（仅影响文件操作，不影响密钥文件）
+	if err := os.Chdir(operateDir); err != nil {
+		log.Fatalf("切换到FILES操作目录失败: %v", err)
+	}
+
+	// 4. 初始化配置
 	config := &SFTPConfig{
 		ListenAddr:         *listenAddr,
-		HostKeyPath:        *hostKeyPath,
-		AuthorizedKeysPath: *authorizedKeysPath,
-		RootDir:            rootDir,
+		HostKeyPath:        hostKeyAbsPath, // 私钥绝对路径（当前目录）
+		AuthorizedKeysPath: authKeyAbsPath, // 公钥绝对路径（当前目录）
+		RootDir:            operateDir,     // FILES操作目录
 	}
 
-	// 生成服务器私钥（如果不存在）
+	// 5. 生成服务器私钥（仅当不存在时，存当前目录）
 	if _, err := os.Stat(config.HostKeyPath); os.IsNotExist(err) {
 		if err := generateHostKey(config.HostKeyPath); err != nil {
 			log.Fatalf("生成私钥失败: %v", err)
 		}
 	}
 
-	// 检查授权公钥文件
+	// 6. 检查授权公钥文件（当前目录）
 	if _, err := os.Stat(config.AuthorizedKeysPath); os.IsNotExist(err) {
-		log.Fatalf("授权公钥文件不存在: %s\n请添加客户端公钥到该文件", config.AuthorizedKeysPath)
+		log.Fatalf("授权公钥文件不存在: %s\n请添加客户端公钥到该文件（当前目录）", config.AuthorizedKeysPath)
 	}
 
-	// 加载授权公钥
+	// 7. 加载授权公钥（当前目录）
 	authorizedKeys, err := loadAuthorizedKeys(config.AuthorizedKeysPath)
 	if err != nil {
 		log.Fatalf("加载公钥失败: %v", err)
 	}
 
-	// 启动监听
+	// 8. 启动监听
 	listener, err := net.Listen("tcp", config.ListenAddr)
 	if err != nil {
 		log.Fatalf("监听失败: %v", err)
 	}
 	defer listener.Close()
 
+	// 打印启动信息（明确区分密钥目录和操作目录）
 	log.Printf("=== SFTP服务器启动成功 ===")
 	log.Printf("监听地址: %s", config.ListenAddr)
-	log.Printf("SFTP根目录: %s (固定)", rootDir)
-	log.Printf("仅支持密钥认证")
+	log.Printf("服务器私钥: %s（当前目录）", config.HostKeyPath)
+	log.Printf("授权公钥: %s（当前目录）", config.AuthorizedKeysPath)
+	log.Printf("SFTP操作目录: %s（仅文件操作）", config.RootDir)
+	log.Printf("仅支持密钥认证，禁用密码登录")
 
 	// 并发处理连接
 	var wg sync.WaitGroup
