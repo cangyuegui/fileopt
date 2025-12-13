@@ -4,11 +4,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +20,8 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// 引入SSH/SFTP依赖
 
 // SFTP服务器配置
 type SFTPConfig struct {
@@ -61,6 +65,78 @@ func generateHostKey(path string) error {
 		return fmt.Errorf("编码私钥失败: %v", err)
 	}
 	log.Printf("服务器私钥已生成（当前目录）: %s", path)
+	return nil
+}
+
+// 生成客户端RSA密钥对 + 自签名证书（新增功能）
+func generateClientKey(clientKeyPath string) error {
+	// 生成客户端2048位RSA私钥
+	clientPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("生成客户端私钥失败: %v", err)
+	}
+
+	// 1. 保存客户端私钥（client_rsa）
+	privKeyFile, err := os.OpenFile(clientKeyPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建客户端私钥文件失败: %v", err)
+	}
+	defer privKeyFile.Close()
+
+	privPemBlock := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientPrivKey)}
+	if err := pem.Encode(privKeyFile, privPemBlock); err != nil {
+		return fmt.Errorf("编码客户端私钥失败: %v", err)
+	}
+
+	// 2. 生成客户端公钥（client_rsa.pub）
+	clientPubKey, err := ssh.NewPublicKey(&clientPrivKey.PublicKey)
+	if err != nil {
+		return fmt.Errorf("生成客户端公钥失败: %v", err)
+	}
+	pubKeyPath := clientKeyPath + ".pub"
+	pubKeyFile, err := os.OpenFile(pubKeyPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("创建客户端公钥文件失败: %v", err)
+	}
+	defer pubKeyFile.Close()
+
+	if _, err := pubKeyFile.Write(ssh.MarshalAuthorizedKey(clientPubKey)); err != nil {
+		return fmt.Errorf("写入客户端公钥失败: %v", err)
+	}
+
+	// 3. 生成客户端自签名证书（client_rsa.crt）
+	crtPath := clientKeyPath + ".crt"
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "SFTP Client"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour), // 有效期1年
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, template, &clientPrivKey.PublicKey, clientPrivKey)
+	if err != nil {
+		return fmt.Errorf("生成客户端证书失败: %v", err)
+	}
+
+	crtFile, err := os.OpenFile(crtPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("创建客户端证书文件失败: %v", err)
+	}
+	defer crtFile.Close()
+
+	crtPemBlock := &pem.Block{Type: "CERTIFICATE", Bytes: certBytes}
+	if err := pem.Encode(crtFile, crtPemBlock); err != nil {
+		return fmt.Errorf("编码客户端证书失败: %v", err)
+	}
+
+	// 打印生成结果
+	log.Printf("=== 客户端密钥/证书生成完成 ===")
+	log.Printf("客户端私钥: %s（当前目录）", clientKeyPath)
+	log.Printf("客户端公钥: %s（可添加到authorized_keys）", pubKeyPath)
+	log.Printf("客户端证书: %s（有效期1年）", crtPath)
 	return nil
 }
 
@@ -178,12 +254,29 @@ func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]boo
 }
 
 func main() {
-	// 命令行参数（密钥文件默认当前目录）
+	// 新增：-client_key 参数（指定客户端密钥生成路径，默认 ./client_rsa）
+	clientKeyGen := flag.String("client_key", "", "生成客户端密钥/证书（指定路径，如 ./client_rsa）")
+
+	// 原有命令行参数（密钥文件默认当前目录）
 	listenAddr := flag.String("addr", ":2022", "监听地址")
 	hostKeyPath := flag.String("host-key", "./sftp_host_rsa.pem", "服务器私钥路径（当前目录）")
-	authorizedKeysPath := flag.String("authorized-keys", "./authorized_keys", "授权公钥路径（当前目录）")
+	authorizedKeysPath := flag.String("authorized-keys", "./client_rsa.pub", "授权公钥路径（当前目录）")
 	flag.Parse()
 
+	// 核心逻辑1：如果指定了 -client_key，先生成客户端密钥/证书，然后退出
+	if *clientKeyGen != "" {
+		clientKeyAbsPath, err := filepath.Abs(*clientKeyGen)
+		if err != nil {
+			log.Fatalf("获取客户端密钥路径失败: %v", err)
+		}
+		if err := generateClientKey(clientKeyAbsPath); err != nil {
+			log.Fatalf("生成客户端密钥/证书失败: %v", err)
+		}
+		// 生成完成后退出，不启动SFTP服务器
+		return
+	}
+
+	// 核心逻辑2：未指定 -client_key，启动SFTP服务器
 	// 1. 初始化路径（核心区分：密钥存当前目录，操作目录是FILES）
 	appDir := getAppDir()                                  // 程序运行目录
 	operateDir := filepath.Join(appDir, "FILES")           // SFTP操作目录（FILES）
