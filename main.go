@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -17,11 +19,207 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// ================= 全局IP黑名单相关 =================
+// IP失败次数记录（线程安全）
+var ipFailMap = sync.Map{}
+
+// IP黑名单（线程安全）
+var ipBlacklist = sync.Map{}
+
+// 黑名单文件路径
+var blacklistFile string
+
+// 日志文件路径
+var logFile string
+
+// 黑名单计数（原子操作，用于攻击检测）
+var blackIPCount int64 = 0
+
+// 配置常量
+const (
+	maxAuthTriesPerIP = 3  // 单IP最大失败次数
+	blacklistMaxCount = 50 // 黑名单最大IP数（超过则自裁）
+	blacklistDirName  = "his_store_bak"
+	blacklistFileName = "sftp_blackip.txt"
+	logFileName       = "sftp.log"
+	selfDestructMsgCn = "遭遇攻击，自裁保护！"
+	selfDestructMsgEn = "Under attack, self-destruct protection!"
+)
+
+// ================= IP黑名单核心功能 =================
+// getClientIP 提取客户端IP
+func getClientIP(remoteAddr string) string {
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return ip
+}
+
+// recordIPFail 记录IP失败次数，超过阈值则加入黑名单
+func recordIPFail(ip string) bool {
+	// 1. 先检查是否已在黑名单（已拉黑则直接返回，无需处理）
+	if _, exists := ipBlacklist.Load(ip); exists {
+		return true
+	}
+
+	// 2. 核心修正：先+1，再判断是否拉黑（统计准确）
+	val, _ := ipFailMap.LoadOrStore(ip, 0) // 初始值设为0，保证第一次+1后为1
+	count := val.(int) + 1                 // 先+1，得到本次失败后的总次数
+	ipFailMap.Store(ip, count)             // 更新失败次数
+	logMsg := fmt.Sprintf(
+		"[%s] IP失败次数记录 | IP: %s | 本次失败后总次数: %d | 拉黑阈值: %d",
+		time.Now().Format(time.RFC3339),
+		ip,
+		count,
+		maxAuthTriesPerIP,
+	)
+	logToFile(logMsg)
+
+	// 3. 判断是否达到拉黑阈值
+	if count >= maxAuthTriesPerIP {
+		// 3.1 加入黑名单
+		ipBlacklist.Store(ip, time.Now().Format(time.RFC3339))
+		newCount := atomic.AddInt64(&blackIPCount, 1)
+
+		// 3.2 关键：拉黑后移除错误列表（释放内存，后续无需处理）
+		ipFailMap.Delete(ip)
+
+		// 3.3 保存黑名单到文件（原函数传了ip参数，需同步修改saveBlacklist）
+		saveBlacklist(ip)
+
+		// 3.4 检查是否触发自裁保护
+		if newCount >= blacklistMaxCount {
+			logMsg := fmt.Sprintf("[%s] %s | %s", time.Now().Format(time.RFC3339), selfDestructMsgCn, selfDestructMsgEn)
+			logToFile(logMsg)
+			fmt.Printf("%s\n", logMsg)
+			os.Exit(1) // 自裁退出
+		}
+		return true
+	}
+
+	// 未达到阈值，返回false
+	return false
+}
+
+// saveBlacklist 将黑名单保存到文件（Base64编码）
+func saveBlacklist(ip string) {
+	// 创建目录
+	if err := os.MkdirAll(filepath.Dir(blacklistFile), 0755); err != nil {
+		logToFile(fmt.Sprintf("创建黑名单目录失败: %v", err))
+		return
+	}
+
+	// Base64编码
+	encoded := base64.StdEncoding.EncodeToString([]byte(ip))
+
+	// 写入文件
+	f, err := os.OpenFile(blacklistFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		logToFile(fmt.Sprintf("打开黑名单文件失败: %v", err))
+		return
+	}
+	defer f.Close()
+
+	// 写入内容（追加）
+	if _, err := f.WriteString(encoded + "\n"); err != nil {
+		logToFile(fmt.Sprintf("追加黑名单失败: %v", err))
+	} else {
+		logToFile(fmt.Sprintf("追加黑名单成功，当前黑名单总数: %d", blackIPCount))
+	}
+}
+
+func loadBlacklist() {
+	// 检查文件是否存在
+	if _, err := os.Stat(blacklistFile); os.IsNotExist(err) {
+		logToFile("黑名单文件不存在，跳过加载")
+		return
+	}
+
+	// 打开文件（只读模式）
+	file, err := os.Open(blacklistFile)
+	if err != nil {
+		logToFile(fmt.Sprintf("打开黑名单文件失败: %v", err))
+		return
+	}
+	defer file.Close()
+
+	// 按行读取文件
+	scanner := bufio.NewScanner(file)
+	count := 0            // 成功加载的IP数
+	failCount := 0        // 解码失败的行数
+	invalidLineCount := 0 // 无效行（空行/格式错误）数
+
+	for scanner.Scan() {
+		// 读取当前行并去除首尾空格/换行
+		line := strings.TrimSpace(scanner.Text())
+
+		// 跳过空行
+		if line == "" {
+			invalidLineCount++
+			continue
+		}
+
+		// 每行单独进行Base64解码（解码结果即为拉黑IP）
+		decodedIP, err := base64.StdEncoding.DecodeString(line)
+		if err != nil {
+			logToFile(fmt.Sprintf("行内容Base64解码失败 | 行内容: %s | 错误: %v", line, err))
+			failCount++
+			continue
+		}
+
+		// 解码后的IP格式校验（可选：确保是合法IP）
+		ip := string(decodedIP)
+		if net.ParseIP(ip) == nil {
+			logToFile(fmt.Sprintf("解码后非合法IP | 行内容: %s | 解码结果: %s", line, ip))
+			invalidLineCount++
+			continue
+		}
+
+		// 将IP存入黑名单Map（拉黑时间设为加载时的时间，或保留原逻辑）
+		ipBlacklist.Store(ip, time.Now().Format(time.RFC3339))
+		count++
+	}
+
+	// 检查读取过程中是否出错
+	if err := scanner.Err(); err != nil {
+		logToFile(fmt.Sprintf("按行读取黑名单文件失败: %v", err))
+	}
+
+	// 更新黑名单原子计数
+	atomic.StoreInt64(&blackIPCount, int64(count))
+
+	// 打印加载统计日志
+	logToFile(fmt.Sprintf(
+		"黑名单加载完成 | 成功加载IP数: %d | 解码失败行数: %d | 无效行数: %d",
+		count, failCount, invalidLineCount,
+	))
+}
+
+// logToFile 写入日志到文件
+func logToFile(msg string) {
+	// 创建日志文件（追加模式）
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Printf("打开日志文件失败: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	log.Print(msg)
+
+	// 写入日志
+	if _, err := f.WriteString(msg + "\n"); err != nil {
+		fmt.Printf("写入日志失败: %v\n", err)
+	}
+}
 
 /* ================= 工具：路径隔离 ================= */
 // 核心：所有客户端路径 → FILES 内真实路径
@@ -359,14 +557,45 @@ func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]boo
 	sshConfig := &ssh.ServerConfig{
 		NoClientAuth:                false,
 		KeyboardInteractiveCallback: nil,
+		MaxAuthTries:                3,
 		PublicKeyCallback: func(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+			// 检查黑名单
+			clientIP := getClientIP(conn.RemoteAddr().String())
+			if _, exists := ipBlacklist.Load(clientIP); exists {
+				logToFile("拒绝密钥认证，IP已被拉黑" + clientIP)
+				return nil, fmt.Errorf("IP已被拉黑")
+			}
+
 			if authorizedKeys[string(pubKey.Marshal())] {
 				log.Printf("公钥认证成功: %s", conn.RemoteAddr())
+				ipFailMap.Delete(clientIP)
 				return &ssh.Permissions{}, nil
 			}
+
+			isBlack := recordIPFail(clientIP)
+			logMsg := fmt.Sprintf("未授权的公钥尝试登录: %s (IP: %s)", conn.RemoteAddr(), clientIP)
+			if isBlack {
+				logMsg += " | IP已加入黑名单"
+				logToFile(fmt.Sprintf("[%s] %s", time.Now().Format(time.RFC3339), logMsg))
+			}
+
 			return nil, fmt.Errorf("未授权的公钥")
 		},
 		PasswordCallback: func(_ ssh.ConnMetadata, _ []byte) (*ssh.Permissions, error) {
+			// 检查黑名单
+			clientIP := getClientIP(conn.RemoteAddr().String())
+			if _, exists := ipBlacklist.Load(clientIP); exists {
+				logToFile("拒绝密码认证，IP已被拉黑" + clientIP)
+				return nil, fmt.Errorf("IP已被拉黑")
+			}
+
+			isBlack := recordIPFail(clientIP)
+			logMsg := fmt.Sprintf("禁止使用密码登录: %s (IP: %s)", conn.RemoteAddr(), clientIP)
+			if isBlack {
+				logMsg += " | IP已加入黑名单"
+				logToFile(fmt.Sprintf("[%s] %s", time.Now().Format(time.RFC3339), logMsg))
+			}
+
 			return nil, fmt.Errorf("禁用密码登录")
 		},
 	}
@@ -456,9 +685,15 @@ func main() {
 		return
 	}
 
+	appDir := getAppDir()
+
+	// 启动时加载黑名单
+	blacklistFile = filepath.Join(appDir, blacklistDirName, blacklistFileName)
+	logFile = filepath.Join(appDir, logFileName)
+	loadBlacklist()
+
 	// 核心逻辑2：未指定 -client_key，启动SFTP服务器
-	// 1. 初始化路径（核心区分：密钥存当前目录，操作目录是FILES）
-	appDir := getAppDir()                                  // 程序运行目录
+	// 1. 初始化路径（核心区分：密钥存当前目录，操作目录是FILES）                    // 程序运行目录
 	operateDir := filepath.Join(appDir, "FILES")           // SFTP操作目录（FILES）
 	hostKeyAbsPath, _ := filepath.Abs(*hostKeyPath)        // 私钥绝对路径（当前目录）
 	authKeyAbsPath, _ := filepath.Abs(*authorizedKeysPath) // 公钥绝对路径（当前目录）
