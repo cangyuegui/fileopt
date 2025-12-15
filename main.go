@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,92 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// ////test
+// 包装 net.Conn，监控所有读写/关闭操作
+type MonitoredConn struct {
+	net.Conn
+	clientAddr  string // 客户端地址
+	closeReason string // 连接关闭原因
+	closed      bool   // 是否已关闭
+	mu          sync.Mutex
+}
+
+// 重写 Read 方法，捕获读错误
+func (m *MonitoredConn) Read(b []byte) (int, error) {
+	n, err := m.Conn.Read(b)
+	if err != nil && err != io.EOF {
+		m.setCloseReason("读操作失败: " + err.Error())
+		log.Printf("[MonitoredConn] 客户端 %s | Read 错误: %v | 堆栈: %s",
+			m.clientAddr, err, string(debug.Stack()))
+	} else if err == io.EOF {
+		m.setCloseReason("客户端主动关闭连接（EOF）")
+	}
+	m.SetDeadline(time.Now().Add(30 * time.Second))
+	return n, err
+}
+
+// 重写 Write 方法，捕获写错误
+func (m *MonitoredConn) Write(b []byte) (int, error) {
+	n, err := m.Conn.Write(b)
+	if err != nil {
+		m.setCloseReason("写操作失败: " + err.Error())
+		log.Printf("[MonitoredConn] 客户端 %s | Write 错误: %v | 堆栈: %s",
+			m.clientAddr, err, string(debug.Stack()))
+	}
+	m.SetDeadline(time.Now().Add(30 * time.Second))
+	return n, err
+}
+
+// 重写 Close 方法，记录主动关闭原因
+func (m *MonitoredConn) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	// 如果未设置关闭原因，默认标记为"主动关闭"
+	if m.closeReason == "" {
+		m.closeReason = "服务端主动调用 Close()"
+	}
+	log.Printf("[MonitoredConn] 客户端 %s | 连接关闭 | 原因: %s", m.clientAddr, m.closeReason)
+	return m.Conn.Close()
+}
+
+// 重写 SetDeadline，监控超时设置
+func (m *MonitoredConn) SetDeadline(t time.Time) error {
+	err := m.Conn.SetDeadline(t)
+	if err != nil {
+		m.setCloseReason("设置超时失败: " + err.Error())
+		log.Printf("[MonitoredConn] 客户端 %s | SetDeadline 错误: %v", m.clientAddr, err)
+	}
+	/*else {
+		if !t.IsZero() {
+			log.Printf("[MonitoredConn] 客户端 %s | 设置超时: %s", m.clientAddr, t.Sub(time.Now()))
+		}
+	}*/
+	return err
+}
+
+// 私有方法：设置关闭原因（线程安全）
+func (m *MonitoredConn) setCloseReason(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closeReason == "" {
+		m.closeReason = reason
+	}
+}
+
+// 辅助函数：创建监控连接
+func NewMonitoredConn(conn net.Conn) *MonitoredConn {
+	return &MonitoredConn{
+		Conn:       conn,
+		clientAddr: conn.RemoteAddr().String(),
+	}
+}
+
+//////test
 
 // ================= 全局IP黑名单相关 =================
 // IP失败次数记录（线程安全）
@@ -537,7 +624,16 @@ func loadAuthorizedKeys(path string) (map[string]bool, error) {
 
 // 处理SFTP连接
 func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]bool) {
-	defer conn.Close()
+	defer func() {
+		r := recover()
+		if r != nil {
+			log.Printf("[PANIC] 客户端: %s | 错误: %v | 堆栈: %s",
+				conn.RemoteAddr(), r, string(debug.Stack()))
+		}
+		conn.Close()
+	}()
+
+	//defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	log.Printf("新连接: %s", conn.RemoteAddr())
 
@@ -610,9 +706,9 @@ func handleSFTP(conn net.Conn, config *SFTPConfig, authorizedKeys map[string]boo
 	defer sshConn.Close()
 
 	// 设置会话超时
-	if netConn, ok := sshConn.Conn.(net.Conn); ok {
+	/*if netConn, ok := sshConn.Conn.(net.Conn); ok {
 		netConn.SetDeadline(time.Now().Add(2 * time.Hour))
-	}
+	}*/
 
 	// 丢弃无关请求
 	go ssh.DiscardRequests(reqs)
@@ -752,11 +848,14 @@ func main() {
 	// 并发处理连接
 	var wg sync.WaitGroup
 	for {
-		conn, err := listener.Accept()
+		rawConn, err := listener.Accept()
 		if err != nil {
 			log.Printf("接受连接失败: %v", err)
 			continue
 		}
+
+		conn := NewMonitoredConn(rawConn)
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
